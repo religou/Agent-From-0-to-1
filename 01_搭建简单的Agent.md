@@ -416,3 +416,373 @@ if __name__ == "__main__":
 ```
 
 基于 Prompt 构建的ToolCall会导致如果大模型返回的工具名称不完美的话，会导致直接不返回内容，所以使用装饰器 @tool 来绑定工具，并且 LangChain 要求每个工具下面需要用注释来说明该工具的具体实现，以满足大模型可以知道什么时候可以调用该工具
+
+## 3. ReAct
+
+### 3.1. ReAct 的理论
+
+#### 3.1.1. ReAct 作用
+
+模型只能完成单一的工作，无法完成一个任务，所以引入了 AgentLoop
+
+当没有 ReAct 机制时，大模型与 Agent 在处理任务是怎么操作的？
+
+以 “做一个西红柿炒蛋”为例
+
+纯思考模式：
+
+> 需要有西红柿、蛋、葱、盐，开始炒，炒好
+>
+> 缺少了与世界的交互，有没有西红柿、有没有蛋等这些现实因素
+
+纯行动模式：
+
+> 不管三七二十一，把大白菜、猪肉、粉条炒了
+>
+> 最后炒成猪肉炖粉条了
+
+ReAct模式：
+
+> Thought（思考）：我要做西红柿炒鸡蛋，第一步得检查冰箱里还有什么。
+> Action（行动）：打开冰箱查看。
+> Observation（观察结果）：冰箱里有鸡蛋，但没有西红柿和葱。
+> Thought（思考）：缺西红柿和葱，需要去超市。去之前得看看超市关门没。
+> Action（行动）：打开手机地图查看附近超市营业时间。
+> Observation（观察结果）：永辉超市营业到晚上 10 点，现在 8 点，还开着。
+> Thought（思考）：时间来得及，骑车过去最快。
+> Action（行动）：骑共享单车去永辉超市购买食材。
+> Observation（观察结果）：买到了西红柿和葱，花费 15 元。
+> Thought（思考）：食材齐了，任务完成。
+> Final Answer（最终答案）：回家做西红柿炒鸡蛋。
+> 总结：ReAct 的核心魅力就在于 “Thought -> Action -> Observation” 的不断循环。它让 AI 能够根据外界的实时反馈，动态调整自己的思考下一步该干什么。
+
+#### 3.1.2. ReAct 基本流程
+
+最经典Loop范式的就是 ReAct，其中 Re 代表 Reasoning，Act 代表 Action
+
+ReAct 流程：
+
+- 思考：输入模型，输出调用
+- 行动：执行 Tool 逻辑
+- 反馈：结果放回模型重复思考
+
+![1781014306495](images/01_搭建简单的Agent/1781014306495.png)
+
+#### 3.1.3. ReAct 实现原理
+
+在代码层面，就是写了一个 While 循环，大模型每次输出文本时，用正则表达式去拦截它的输出
+
+- 如果它输出了 Action:，我们就去执行对应的 API（工具），把 API 返回的结果作为 Observation: 拼接到上下文中，再扔给大模型进行下一次推理。
+- 如果它输出了 Final Answer:，循环结束，把答案返回给用户。
+- 需要有健壮的 Parser，可以用正则表达式去提取内容
+
+    ```python
+    def execute_agent_step(llm_output: str, available_tools: dict) -> dict:
+      """
+      健壮的 Agent 步骤解析与路由执行器
+      """
+      try:
+          # 1. 优先尝试结构化解析 (假设我们使用了 Tool Calling)
+          if "tool_calls" in llm_output:
+              tool_call = llm_output["tool_calls"][0]
+              action = tool_call["function"]["name"]
+              action_input = json.loads(tool_call["function"]["arguments"])
+          else:
+              # 2. Fallback: 传统文本解析 (带宽容正则)
+              parsed = parse_react_output_fallback(llm_output)
+              action = parsed["action"]
+              action_input = json.loads(parsed["action_input"]) # 尝试转为 dict
+
+          # 3. 白名单校验 (防幻觉)
+          if action not in available_tools:
+              return {
+                  "status": "error",
+                  "observation": f"Error: 工具 '{action}' 不存在。可用工具: {list(available_tools.keys())}"
+              }
+
+          # 4. 执行真实工具
+          tool_func = available_tools[action]
+          result = tool_func(**action_input)
+
+          return {"status": "success", "observation": str(result)}
+
+      except json.JSONDecodeError:
+          # 5. 容错：JSON 解析失败，让模型自己修
+          return {
+              "status": "retry",
+              "observation": "Error: Action Input 不是有效的 JSON 格式。请检查你的引号和括号，重新输出。"
+          }
+      except Exception as e:
+          # 6. 兜底：未知错误，记录日志并返回安全提示
+          logger.error(f"Parser execution failed: {e}")
+          return {
+              "status": "error",
+              "observation": f"系统执行出错: {str(e)}。请尝试简化你的 Action Input 或换一种方式。"
+          }
+    ```
+
+- 需要加入 Retry 机制，如果解析失败，或者调用了不存在的工具，要把错误信息（"Error: Tool not found"）作为 Observation 喂给模型，让它自我纠正重新输出。
+- 需要设置 Max Iterations（最大循环次数），比如 10 次。防止模型陷入死循环（比如一直搜索不到结果，就一直换词搜索，浪费 Token
+
+#### 3.1.4. ReAct仍然存在的问题
+
+- 太慢、太贵：因为 ReAct 属于是“走一步、看一步”，并且每次执行完 Action 之后，都需要把返回的 Thought 和 Observation 重新发给大模型，重新生成。如果任务需要 10 步，大模型就需要调用 10次，Token 消耗呈指数级增长。
+- 缺乏全局规划：因为 ReAct 本质上是贪心算法，只看眼前的最优解。遇到长链路任务，就存在可能会忘记最初的目标，陷入局部最优解的死胡同。
+- 缺乏反思模式：ReAct 机制中，如果 Observation 返回了错误，可能会盲目重试，并不会反思具体是哪里错了
+
+### 3.2. ReAct 的代码实现
+
+**任务：使用 ReAct 实现将 a.txt 文件从 inbox 移动到 archive，并且返回具体的目录变化**
+
+#### 3.2.1. 手搓 ReAct
+
+```Python
+from __future__ import annotations
+
+import os
+import shutil
+import sys
+from pathlib import Path
+
+from dotenv import load_dotenv
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+from langchain_core.tools import tool
+from langchain_openai import ChatOpenAI
+
+DEFAULT_TASK = "请检查 inbox，把 a.txt 移动到 archive，然后告诉我整理后的目录变化。"
+WORKSPACE = Path(__file__).resolve().parent / "demo_workspace"
+
+# 重构工作区
+def reset_workspace() -> None:
+    if WORKSPACE.exists():
+        shutil.rmtree(WORKSPACE)
+    (WORKSPACE / "inbox").mkdir(parents=True)
+    (WORKSPACE / "archive").mkdir()
+    (WORKSPACE / "inbox" / "a.txt").write_text(
+        "Hello from MokioClaw AgentLoop demo.",
+        encoding="utf-8",
+    )
+
+# 展示工作区内容
+def show_workspace() -> str:
+    items = sorted(WORKSPACE.rglob("*"))
+    lines = []
+    for item in items:
+        rel = item.relative_to(WORKSPACE).as_posix()
+        lines.append(f"- {rel}/" if item.is_dir() else f"- {rel}")
+    return "\n".join(lines) or "(empty)"
+
+
+def workspace_path(path: str) -> Path:
+    path = path.strip().replace("\\", "/")
+    return WORKSPACE if path == "." else WORKSPACE / path.strip("/")
+
+# 定义列出文件清单的工具
+@tool
+def list_files(path: str = ".") -> str:
+    """List files in the demo workspace."""
+    target = workspace_path(path)
+    if target.is_file():
+        return target.relative_to(WORKSPACE).as_posix()
+    files = sorted(item for item in target.rglob("*") if item.is_file())
+    return "\n".join(f"- {item.relative_to(WORKSPACE).as_posix()}" for item in files) or "(empty)"
+
+# 定义移动文件的工具
+@tool
+def move_file(source: str, target: str) -> str:
+    """Move a file in the demo workspace."""
+    source_path = workspace_path(source)
+    target_path = workspace_path(target)
+    if "." not in target_path.name:
+        target_path = target_path / source_path.name
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(source_path), str(target_path))
+    return f"moved {source} -> {target_path.relative_to(WORKSPACE).as_posix()}"
+
+
+def load_llm() -> ChatOpenAI:
+    load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+    return ChatOpenAI(
+        model=os.getenv("MODEL", "qwen3.6-flash"),
+        base_url=os.getenv("BASE_URL"),
+        api_key=os.getenv("API_KEY"),
+        temperature=0,
+    )
+
+
+SYSTEM_PROMPT = """
+你是一个文件整理助手。
+你可以反复调用工具，直到完成用户任务。
+推荐顺序：先 list_files("inbox")，再 move_file("inbox/a.txt", "archive/a.txt")，再 list_files(".")，最后总结。
+每一轮最多调用一个工具。
+""".strip()
+
+
+def main() -> None:
+    task = " ".join(sys.argv[1:]).strip() or DEFAULT_TASK
+    reset_workspace()
+
+    print("=== 01. 手写 while AgentLoop ===")
+    print("\n用户任务:")
+    print(task)
+    print("\n运行前 workspace:")
+    print(show_workspace())
+
+    tools = [list_files, move_file]
+    tool_map = {item.name: item for item in tools}
+    llm = load_llm().bind_tools(tools)
+
+    messages = [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=task)]
+
+    for turn in range(1, 8):
+        print(f"\n--- 第 {turn} 轮：模型思考 ---")
+        response = llm.invoke(messages)
+        messages.append(response)
+
+        if not response.tool_calls:
+            print("\n最终回答:")
+            print(response.content)
+            break
+
+        tool_call = response.tool_calls[0]
+        print("\n模型决定调用工具:")
+        print(f"tool_name = {tool_call['name']}")
+        print(f"tool_args = {tool_call['args']}")
+
+        result = tool_map[tool_call["name"]].invoke(tool_call["args"])
+        print("\n工具返回:")
+        print(result)
+
+        messages.append(
+            ToolMessage(
+                content=str(result),
+                name=tool_call["name"],
+                tool_call_id=tool_call["id"],
+            )
+        )
+
+    print("\n运行后 workspace:")
+    print(show_workspace())
+
+
+if __name__ == "__main__":
+    main()
+```
+
+#### 3.2.2. 基于 LangChain 完成 ReAct
+
+```python
+from __future__ import annotations
+
+import os
+import shutil
+import sys
+from pathlib import Path
+
+from dotenv import load_dotenv
+from langchain_core.tools import tool
+from langchain_openai import ChatOpenAI
+from langchain.agents import create_agent
+
+DEFAULT_TASK = "请检查 inbox，把 a.txt 移动到 archive，然后告诉我整理后的目录变化。"
+WORKSPACE = Path(__file__).resolve().parent / "demo_workspace"
+
+
+def reset_workspace() -> None:
+    if WORKSPACE.exists():
+        shutil.rmtree(WORKSPACE)
+    (WORKSPACE / "inbox").mkdir(parents=True)
+    (WORKSPACE / "archive").mkdir()
+    (WORKSPACE / "inbox" / "a.txt").write_text(
+        "Hello from MokioClaw AgentLoop demo.",
+        encoding="utf-8",
+    )
+
+
+def show_workspace() -> str:
+    items = sorted(WORKSPACE.rglob("*"))
+    lines = []
+    for item in items:
+        rel = item.relative_to(WORKSPACE).as_posix()
+        lines.append(f"- {rel}/" if item.is_dir() else f"- {rel}")
+    return "\n".join(lines) or "(empty)"
+
+
+def workspace_path(path: str) -> Path:
+    path = path.strip().replace("\\", "/")
+    return WORKSPACE if path == "." else WORKSPACE / path.strip("/")
+
+
+@tool
+def list_files(path: str = ".") -> str:
+    """List files in the demo workspace."""
+    target = workspace_path(path)
+    if target.is_file():
+        return target.relative_to(WORKSPACE).as_posix()
+    files = sorted(item for item in target.rglob("*") if item.is_file())
+    return "\n".join(f"- {item.relative_to(WORKSPACE).as_posix()}" for item in files) or "(empty)"
+
+
+@tool
+def move_file(source: str, target: str) -> str:
+    """Move a file in the demo workspace."""
+    source_path = workspace_path(source)
+    target_path = workspace_path(target)
+    if "." not in target_path.name:
+        target_path = target_path / source_path.name
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(source_path), str(target_path))
+    return f"moved {source} -> {target_path.relative_to(WORKSPACE).as_posix()}"
+
+
+def load_llm() -> ChatOpenAI:
+    load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+    return ChatOpenAI(
+        model=os.getenv("MODEL", "qwen3.6-flash"),
+        base_url=os.getenv("BASE_URL"),
+        api_key=os.getenv("API_KEY"),
+        temperature=0,
+    )
+
+
+SYSTEM_PROMPT = """
+你是一个 ReAct 文件整理助手。
+ReAct 的节奏是：观察当前状态 -> 选择一个工具行动 -> 查看工具结果 -> 决定下一步。
+目标：检查 inbox，移动 inbox/a.txt 到 archive/a.txt，查看整理后的目录，然后总结。
+每一轮最多调用一个工具。
+""".strip()
+
+
+def main() -> None:
+
+    task = " ".join(sys.argv[1:]).strip() or DEFAULT_TASK
+    reset_workspace()
+
+    print("=== 02. LangChain create_agent：封装好的 ReAct Loop ===")
+    print("\n用户任务:")
+    print(task)
+    print("\n运行前 workspace:")
+    print(show_workspace())
+
+    agent = create_agent(
+        model=load_llm(),
+        tools=[list_files, move_file],
+        system_prompt=SYSTEM_PROMPT,
+    )
+    result = agent.invoke({"messages": [{"role": "user", "content": task}]})
+
+    print("\nAgent 消息流:")
+    for message in result["messages"]:
+        print(f"\n[{getattr(message, 'type', 'unknown')}]")
+        if getattr(message, "tool_calls", None):
+            print(message.tool_calls)
+        elif getattr(message, "content", ""):
+            print(message.content)
+
+    print("\n运行后 workspace:")
+    print(show_workspace())
+
+
+if __name__ == "__main__":
+    main()
+```
