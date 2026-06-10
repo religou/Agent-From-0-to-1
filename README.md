@@ -3,8 +3,8 @@
 - [ ] 01 搭建简单的Agent
     - [x] LangChain & LangGraph 简介
     - [x] ToolCall 理论 & 代码实现
-    - [ ] ReAct 理论 & 代码实现
-    - [ ] Reflection 理论 & 代码实现
+    - [x] ReAct 理论 & 代码实现
+    - [x] Reflection 理论 & 代码实现
     - [ ] Plan & Execute 理论 & 代码实现
     - [ ] MultiAgent 理论 & 代码实现
     - [ ] ContextEngineer 理论 & 代码实现
